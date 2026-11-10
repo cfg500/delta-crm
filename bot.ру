@@ -1,0 +1,727 @@
+import os
+import asyncio
+import sqlite3
+import logging
+from datetime import datetime
+from html import escape
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+
+# ===== НАСТРОЙКИ =====
+
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = 8495236372
+DB_NAME = "delta_crm.db"
+
+if not TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ===== БАЗА ДАННЫХ =====
+
+def connect():
+    return sqlite3.connect(DB_NAME)
+
+
+def init_db():
+    con = connect()
+    cur = con.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        name TEXT,
+        role TEXT DEFAULT 'agent',
+        active INTEGER DEFAULT 1
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS objects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER,
+        agent_name TEXT,
+        created_at TEXT,
+        object_name TEXT,
+        address TEXT,
+        chop TEXT,
+        monthly_fee TEXT,
+        equipment TEXT,
+        security_type TEXT,
+        lpr_name TEXT,
+        lpr_phone TEXT,
+        extra_contact TEXT,
+        status TEXT,
+        followup TEXT,
+        refusal_reason TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        action TEXT,
+        created_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    INSERT OR IGNORE INTO users
+    (user_id, name, role, active)
+    VALUES (?, ?, 'owner', 1)
+    """, (OWNER_ID, "Главный руководитель"))
+
+    con.commit()
+    con.close()
+
+
+def get_user(user_id):
+    con = connect()
+    result = con.execute(
+        "SELECT user_id, name, role, active FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+    con.close()
+    return result
+
+
+def register_user(user):
+    con = connect()
+
+    con.execute("""
+    INSERT OR IGNORE INTO users
+    (user_id, name, role, active)
+    VALUES (?, ?, 'agent', 1)
+    """, (user.id, user.full_name))
+
+    con.execute("""
+    UPDATE users SET name=?
+    WHERE user_id=? AND active=1
+    """, (user.full_name, user.id))
+
+    con.commit()
+    con.close()
+
+
+def is_active(user_id):
+    user = get_user(user_id)
+    return bool(user and user[3] == 1)
+
+
+def is_manager(user_id):
+    user = get_user(user_id)
+    return bool(
+        user and user[3] == 1
+        and user[2] in ("owner", "manager")
+    )
+
+
+def log_action(user_id, action):
+    con = connect()
+    con.execute("""
+    INSERT INTO logs (user_id, action, created_at)
+    VALUES (?, ?, ?)
+    """, (
+        user_id,
+        action,
+        datetime.now().strftime("%d.%m.%Y %H:%M")
+    ))
+    con.commit()
+    con.close()
+
+
+# ===== СОСТОЯНИЯ АНКЕТЫ =====
+
+class Form(StatesGroup):
+    object_name = State()
+    address = State()
+    chop = State()
+    monthly_fee = State()
+    equipment = State()
+    security_type = State()
+    lpr_name = State()
+    lpr_phone = State()
+    extra_contact = State()
+    status = State()
+    followup = State()
+    refusal_reason = State()
+
+
+# ===== ВАРИАНТЫ ОТВЕТОВ =====
+
+EQUIPMENT = [
+    "Ajax",
+    "Болид / ВЭРС / Гранит / проводная клавиатура",
+    "Другое",
+    "Не удалось увидеть"
+]
+
+SECURITY = [
+    "Только сигнализация",
+    "Только тревожная кнопка (КТВ)",
+    "Полный комплект"
+]
+
+STATUSES = [
+    "HOT",
+    "WARM",
+    "COOL",
+    "ОТКАЗ"
+]
+
+
+def make_keyboard(options):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=option,
+                    callback_data=f"choice:{index}"
+                )
+            ]
+            for index, option in enumerate(options)
+        ]
+    )
+
+    # ===== ПРОВЕРКА ДОСТУПА =====
+
+async def check_access(message: Message):
+    if not is_active(message.from_user.id):
+        await message.answer("⛔ Доступ закрыт. Обратитесь к руководителю.")
+        return False
+    return True
+
+
+# ===== СОЗДАНИЕ АНКЕТЫ =====
+
+@dp.message(Command("new"))
+async def new_object(message: Message, state: FSMContext):
+    if not await check_access(message):
+        return
+
+    await state.clear()
+    await state.update_data(
+        agent_id=message.from_user.id,
+        agent_name=message.from_user.full_name,
+        created_at=datetime.now().strftime("%d.%m.%Y %H:%M")
+    )
+
+    await state.set_state(Form.object_name)
+    await message.answer(
+        "🏪 <b>Новая анкета DELTA CRM</b>\n\n"
+        "1. Введите название торговой точки или вывеску:"
+    )
+
+
+@dp.message(Form.object_name)
+async def get_object_name(message: Message, state: FSMContext):
+    await state.update_data(object_name=message.text)
+    await state.set_state(Form.address)
+    await message.answer(
+        "📍 2. Укажите точный адрес: улица, дом, офис или павильон."
+    )
+
+
+@dp.message(Form.address)
+async def get_address(message: Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(Form.chop)
+    await message.answer(
+        "🛡 3. Какой ЧОП сейчас обслуживает объект?\n"
+        "Если неизвестно, напишите «Неизвестно»."
+    )
+
+
+@dp.message(Form.chop)
+async def get_chop(message: Message, state: FSMContext):
+    await state.update_data(chop=message.text)
+    await state.set_state(Form.monthly_fee)
+    await message.answer(
+        "💰 4. Какая действующая абонентская плата в месяц?\n"
+        "Если неизвестно, напишите «Неизвестно»."
+    )
+
+
+@dp.message(Form.monthly_fee)
+async def get_fee(message: Message, state: FSMContext):
+    await state.update_data(monthly_fee=message.text)
+    await state.set_state(Form.equipment)
+    await message.answer(
+        "🔧 5. Какое оборудование установлено?",
+        reply_markup=make_keyboard(EQUIPMENT)
+    )
+
+
+# ===== ОБРАБОТКА ВЫБОРА ОБОРУДОВАНИЯ =====
+
+@dp.callback_query(Form.equipment, F.data.startswith("choice:"))
+async def get_equipment(callback: CallbackQuery, state: FSMContext):
+    try:
+        index = int(callback.data.split(":")[1])
+        value = EQUIPMENT[index]
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    await state.update_data(equipment=value)
+    await state.set_state(Form.security_type)
+
+    await callback.message.edit_text(
+        "🚨 6. Какой тип охраны используется?",
+        reply_markup=make_keyboard(SECURITY)
+    )
+    await callback.answer()
+
+
+# ===== ТИП ОХРАНЫ =====
+
+@dp.callback_query(Form.security_type, F.data.startswith("choice:"))
+async def get_security(callback: CallbackQuery, state: FSMContext):
+    try:
+        index = int(callback.data.split(":")[1])
+        value = SECURITY[index]
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    await state.update_data(security_type=value)
+    await state.set_state(Form.lpr_name)
+
+    await callback.message.edit_text(
+        "👤 <b>Блок Б. Контакты</b>\n\n"
+        "7. Укажите ФИО ЛПР и его должность:"
+    )
+    await callback.answer()
+
+
+@dp.message(Form.lpr_name)
+async def get_lpr_name(message: Message, state: FSMContext):
+    await state.update_data(lpr_name=message.text)
+    await state.set_state(Form.lpr_phone)
+    await message.answer("📞 8. Укажите телефон ЛПР:")
+
+
+@dp.message(Form.lpr_phone)
+async def get_lpr_phone(message: Message, state: FSMContext):
+    await state.update_data(lpr_phone=message.text)
+    await state.set_state(Form.extra_contact)
+    await message.answer(
+        "🔗 9. Дополнительный контакт: Instagram, Telegram, сайт.\n"
+        "Если нет — напишите «Нет»."
+    )
+
+
+@dp.message(Form.extra_contact)
+async def get_extra_contact(message: Message, state: FSMContext):
+    await state.update_data(extra_contact=message.text)
+    await state.set_state(Form.status)
+
+    await message.answer(
+        "📊 <b>Блок В. Результат визита</b>\n\n"
+        "10. Выберите статус объекта:",
+        reply_markup=make_keyboard(STATUSES)
+    )
+
+
+# ===== ВЫБОР СТАТУСА =====
+
+@dp.callback_query(Form.status, F.data.startswith("choice:"))
+async def get_status(callback: CallbackQuery, state: FSMContext):
+    try:
+        index = int(callback.data.split(":")[1])
+        status = STATUSES[index]
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+
+    await state.update_data(status=status)
+
+    if status == "HOT":
+        await state.set_state(Form.followup)
+        question = (
+            "🔥 Укажите дату и время замера сигнала техником.\n"
+            "Если время ещё не назначено — напишите «Не назначено»."
+        )
+
+    elif status == "WARM":
+        await state.set_state(Form.followup)
+        question = (
+            "🟡 Укажите дату и время созвона с директором."
+        )
+
+    elif status == "ОТКАЗ":
+        await state.set_state(Form.refusal_reason)
+        question = "❌ Укажите причину отказа."
+
+    else:
+        await save_object(callback.message, state)
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(question)
+    await callback.answer()
+
+
+# ===== ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ =====
+
+@dp.message(Form.followup)
+async def get_followup(message: Message, state: FSMContext):
+    await state.update_data(followup=message.text)
+    await save_object(message, state)
+
+
+@dp.message(Form.refusal_reason)
+async def get_refusal(message: Message, state: FSMContext):
+    await state.update_data(refusal_reason=message.text)
+    await save_object(message, state)
+
+
+# ===== СОХРАНЕНИЕ АНКЕТЫ =====
+
+async def save_object(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    con = connect()
+    con.execute("""
+        INSERT INTO objects (
+            agent_id, agent_name, created_at,
+            object_name, address, chop, monthly_fee,
+            equipment, security_type, lpr_name,
+            lpr_phone, extra_contact, status,
+            followup, refusal_reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data["agent_id"],
+        data["agent_name"],
+        data["created_at"],
+        data["object_name"],
+        data["address"],
+        data["chop"],
+        data["monthly_fee"],
+        data["equipment"],
+        data["security_type"],
+        data["lpr_name"],
+        data["lpr_phone"],
+        data["extra_contact"],
+        data["status"],
+        data.get("followup", ""),
+        data.get("refusal_reason", "")
+    ))
+
+    con.commit()
+    con.close()
+
+    log_action(data["agent_id"], "Создан объект")
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Анкета успешно сохранена!</b>\n\n"
+        f"🏪 Объект: {escape(data['object_name'])}\n"
+        f"📍 Адрес: {escape(data['address'])}\n"
+        f"🛡 ЧОП: {escape(data['chop'])}\n"
+        f"💰 Абонентская плата: {escape(data['monthly_fee'])}\n"
+        f"🔧 Оборудование: {escape(data['equipment'])}\n"
+        f"🚨 Охрана: {escape(data['security_type'])}\n"
+        f"👤 ЛПР: {escape(data['lpr_name'])}\n"
+        f"📞 Телефон: {escape(data['lpr_phone'])}\n"
+        f"📊 Статус: <b>{escape(data['status'])}</b>\n\n"
+        "Для следующего объекта используй /new."
+    )
+
+    # ===== МОИ ОБЪЕКТЫ =====
+
+@dp.message(Command("mine"))
+async def my_objects(message: Message):
+    if not await check_access(message):
+        return
+
+    con = connect()
+    rows = con.execute("""
+        SELECT id, object_name, address, status, created_at
+        FROM objects
+        WHERE agent_id=?
+        ORDER BY id DESC
+        LIMIT 30
+    """, (message.from_user.id,)).fetchall()
+    con.close()
+
+    if not rows:
+        await message.answer("У вас пока нет сохранённых объектов.")
+        return
+
+    for row in rows:
+        await message.answer(
+            f"🏪 <b>Объект #{row[0]}</b>\n"
+            f"Название: {escape(row[1] or '')}\n"
+            f"Адрес: {escape(row[2] or '')}\n"
+            f"Статус: {escape(row[3] or '')}\n"
+            f"Дата: {escape(row[4] or '')}"
+        )
+
+
+# ===== ВСЕ ОБЪЕКТЫ =====
+
+@dp.message(Command("all"))
+async def all_objects(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    con = connect()
+    rows = con.execute("""
+        SELECT id, agent_name, object_name, address, status, created_at
+        FROM objects
+        ORDER BY id DESC
+        LIMIT 50
+    """).fetchall()
+    con.close()
+
+    if not rows:
+        await message.answer("Объектов пока нет.")
+        return
+
+    for row in rows:
+        await message.answer(
+            f"🏪 <b>Объект #{row[0]}</b>\n"
+            f"👤 Агент: {escape(row[1] or '')}\n"
+            f"Название: {escape(row[2] or '')}\n"
+            f"Адрес: {escape(row[3] or '')}\n"
+            f"Статус: {escape(row[4] or '')}\n"
+            f"Дата: {escape(row[5] or '')}"
+        )
+
+
+# ===== СТАТИСТИКА =====
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    con = connect()
+
+    total = con.execute(
+        "SELECT COUNT(*) FROM objects"
+    ).fetchone()[0]
+
+    statuses = con.execute("""
+        SELECT status, COUNT(*)
+        FROM objects
+        GROUP BY status
+    """).fetchall()
+
+    agents = con.execute("""
+        SELECT COUNT(*) FROM users
+        WHERE role='agent' AND active=1
+    """).fetchone()[0]
+
+    con.close()
+
+    text = (
+        "📊 <b>Статистика DELTA CRM</b>\n\n"
+        f"Всего объектов: <b>{total}</b>\n"
+        f"Активных агентов: <b>{agents}</b>\n\n"
+    )
+
+    for status, count in statuses:
+        text += f"{escape(status or '')}: {count}\n"
+
+    await message.answer(text)
+
+
+# ===== ДОБАВЛЕНИЕ РУКОВОДИТЕЛЯ =====
+
+@dp.message(Command("addmanager"))
+async def add_manager(message: Message):
+    if not await check_access(message):
+        return
+
+    if message.from_user.id != OWNER_ID:
+        await message.answer("⛔ Только главный руководитель может назначать руководителей.")
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer(
+            "Формат команды:\n/addmanager TELEGRAM_ID"
+        )
+        return
+
+    target_id = int(parts[1])
+
+    con = connect()
+    result = con.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (target_id,)
+    ).fetchone()
+
+    if not result:
+        con.close()
+        await message.answer(
+            "Пользователь ещё не запускал бота. "
+            "Попросите его отправить /start и повторите команду."
+        )
+        return
+
+    con.execute("""
+        UPDATE users SET role='manager', active=1
+        WHERE user_id=?
+    """, (target_id,))
+
+    con.commit()
+    con.close()
+
+    log_action(message.from_user.id, f"Назначен руководитель {target_id}")
+    await message.answer("✅ Руководитель назначен.")
+
+
+# ===== ДОБАВЛЕНИЕ АГЕНТА =====
+
+@dp.message(Command("addagent"))
+async def add_agent(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /addagent TELEGRAM_ID")
+        return
+
+    target_id = int(parts[1])
+
+    con = connect()
+    result = con.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (target_id,)
+    ).fetchone()
+
+    if not result:
+        con.close()
+        await message.answer(
+            "Пользователь ещё не запускал бота. "
+            "Попросите его отправить /start."
+        )
+        return
+
+    con.execute("""
+        UPDATE users SET role='agent', active=1
+        WHERE user_id=?
+    """, (target_id,))
+
+    con.commit()
+    con.close()
+
+    log_action(message.from_user.id, f"Назначен агент {target_id}")
+    await message.answer("✅ Агент добавлен.")
+
+
+# ===== БЛОКИРОВКА =====
+
+@dp.message(Command("block"))
+async def block_user(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /block TELEGRAM_ID")
+        return
+
+    target_id = int(parts[1])
+
+    if target_id == OWNER_ID:
+        await message.answer("Главного руководителя блокировать нельзя.")
+        return
+
+    con = connect()
+    con.execute(
+        "UPDATE users SET active=0 WHERE user_id=?",
+        (target_id,)
+    )
+    con.commit()
+    con.close()
+
+    log_action(message.from_user.id, f"Заблокирован {target_id}")
+    await message.answer("🚫 Пользователь заблокирован.")
+
+
+# ===== РАЗБЛОКИРОВКА =====
+
+@dp.message(Command("unblock"))
+async def unblock_user(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /unblock TELEGRAM_ID")
+        return
+
+    target_id = int(parts[1])
+
+    con = connect()
+    con.execute(
+        "UPDATE users SET active=1 WHERE user_id=?",
+        (target_id,)
+    )
+    con.commit()
+    con.close()
+
+    log_action(message.from_user.id, f"Разблокирован {target_id}")
+    await message.answer("✅ Пользователь разблокирован.")
+
+
+# ===== ЗАПУСК БОТА =====
+
+async def main():
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("DELTA CRM запущен")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
