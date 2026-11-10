@@ -107,15 +107,18 @@ def get_user(user_id):
 def register_user(user):
     con = connect()
 
+    # Новый пользователь появляется в базе,
+    # но доступ автоматически НЕ получает.
     con.execute("""
     INSERT OR IGNORE INTO users
     (user_id, name, role, active)
-    VALUES (?, ?, 'agent', 1)
+    VALUES (?, ?, 'agent', 0)
     """, (user.id, user.full_name))
 
+    # Обновляем имя, не меняя статус доступа.
     con.execute("""
     UPDATE users SET name=?
-    WHERE user_id=? AND active=1
+    WHERE user_id=?
     """, (user.full_name, user.id))
 
     con.commit()
@@ -220,7 +223,11 @@ async def start_command(message: Message):
 
     if not user or user[3] != 1:
         await message.answer(
-            "⛔ Ваш доступ отключён. Обратитесь к руководителю."
+            "⏳ <b>Заявка в DELTA CRM создана.</b>\n\n"
+            "Доступ пока не выдан.\n"
+            "Передай руководителю свой Telegram ID:\n\n"
+            f"<code>{message.from_user.id}</code>\n\n"
+            "После одобрения руководителем бот станет доступен."
         )
         return
 
@@ -232,7 +239,8 @@ async def start_command(message: Message):
             "/mine — мои объекты\n"
             "/all — все объекты\n"
             "/stats — статистика\n"
-            "/addagent TELEGRAM_ID — добавить агента\n"
+            "/pending — ожидают доступа\n"
+            "/addagent TELEGRAM_ID — выдать доступ сотруднику\n"
             "/addmanager TELEGRAM_ID — назначить руководителя"
         )
     else:
@@ -243,11 +251,9 @@ async def start_command(message: Message):
 
     await message.answer(
         f"👋 Привет, {escape(message.from_user.full_name)}!\n\n"
-        "Ты зарегистрирован в DELTA CRM.\n\n"
+        "Добро пожаловать в DELTA CRM.\n\n"
         f"Доступные команды:\n{commands}"
     )
-
-
 @dp.message(Command("new"))
 async def new_object(message: Message, state: FSMContext):
     if not await check_access(message):
@@ -637,6 +643,40 @@ async def add_manager(message: Message):
     log_action(message.from_user.id, f"Назначен руководитель {target_id}")
     await message.answer("✅ Руководитель назначен.")
 
+# ===== ОЖИДАЮЩИЕ ДОСТУПА =====
+
+@dp.message(Command("pending"))
+async def pending_users(message: Message):
+    if not await check_access(message):
+        return
+
+    if not is_manager(message.from_user.id):
+        await message.answer("⛔ Только для руководителей.")
+        return
+
+    con = connect()
+    rows = con.execute("""
+        SELECT user_id, name
+        FROM users
+        WHERE active=0
+        ORDER BY user_id
+    """).fetchall()
+    con.close()
+
+    if not rows:
+        await message.answer("✅ Нет сотрудников, ожидающих доступа.")
+        return
+
+    result = "⏳ <b>Ожидают доступа:</b>\n\n"
+
+    for user_id, name in rows:
+        result += (
+            f"👤 {escape(name or 'Без имени')}\n"
+            f"ID: <code>{user_id}</code>\n"
+            f"/addagent {user_id}\n\n"
+        )
+
+    await message.answer(result)
 
 # ===== ДОБАВЛЕНИЕ АГЕНТА =====
 
@@ -659,15 +699,22 @@ async def add_agent(message: Message):
 
     con = connect()
     result = con.execute(
-        "SELECT user_id FROM users WHERE user_id=?",
+        "SELECT role FROM users WHERE user_id=?",
         (target_id,)
     ).fetchone()
 
     if not result:
         con.close()
         await message.answer(
-            "Пользователь ещё не запускал бота. "
-            "Попросите его отправить /start."
+            "Пользователь ещё не отправлял боту /start. "
+            "Попросите его запустить бота."
+        )
+        return
+
+    if result[0] in ("owner", "manager"):
+        con.close()
+        await message.answer(
+            "⛔ Нельзя изменить роль руководителя этой командой."
         )
         return
 
@@ -679,9 +726,20 @@ async def add_agent(message: Message):
     con.commit()
     con.close()
 
-    log_action(message.from_user.id, f"Назначен агент {target_id}")
-    await message.answer("✅ Агент добавлен.")
+    log_action(message.from_user.id, f"Выдан доступ агенту {target_id}")
 
+    await message.answer("✅ Доступ сотруднику выдан.")
+
+    try:
+        await bot.send_message(
+            target_id,
+            "🎉 <b>Тебе открыт доступ к DELTA CRM!</b>\n\n"
+            "Теперь доступны команды:\n"
+            "/new — создать анкету\n"
+            "/mine — мои объекты"
+        )
+    except Exception:
+        pass
 
 # ===== БЛОКИРОВКА =====
 
